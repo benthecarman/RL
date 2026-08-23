@@ -102,6 +102,25 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         )
 
 
+def _grpo_master_config(tmp_path) -> MasterConfig:
+    """A minimal GRPO MasterConfig the real __init__ accepts."""
+    return MasterConfig.model_construct(
+        policy={"train_global_batch_size": 8},
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=2,
+            num_generations_per_prompt=4,
+        ),
+        loss_fn=ClippedPGLossConfig(force_on_policy_ratio=False),
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=1,
+            max_buffered_rollouts=4,
+        ),
+        logger={},
+        env={},
+        checkpointing=_checkpointing_config(tmp_path),
+    )
+
+
 def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     monkeypatch,
     capsys: pytest.CaptureFixture[str],
@@ -156,6 +175,66 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     output = capsys.readouterr().out
     assert "weight_sync=FakeWeightSynchronizer" in output
     assert "transport=stub" not in output
+
+
+def _actor_args_for_init(**overrides) -> SimpleNamespace:
+    """Minimal actor args for a controller built through the real __init__."""
+    args = dict(
+        partition_id="rollout_data",
+        dp_client=None,
+        gen_handle=None,
+        trainer_handle=None,
+        dataloader=None,
+        weight_synchronizer=FakeWeightSynchronizer(),
+        advantage_estimator=None,
+        loss_fn=None,
+        tq_buffer=None,
+        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        env_handles={},
+        fleet_monitor=None,
+        generation_router=None,
+        train_cluster=None,
+        inference_cluster=None,
+        save_state=_initial_grpo_save_state(),
+        last_checkpoint_path=None,
+    )
+    args.update(overrides)
+    return SimpleNamespace(**args)
+
+
+def _init_controller(master_config, actor_args):
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    return controller_cls(
+        master_config=master_config,
+        actor_args=actor_args,
+        setup_timing_metrics=SetupTimingMetrics(),
+    )
+
+
+def test_init_picks_up_the_critic_handles(monkeypatch, tmp_path) -> None:
+    """The PPO path hands the critic and its loss in through actor_args."""
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    value, value_loss_fn = MagicMock(name="value"), MagicMock(name="value_loss_fn")
+
+    ctrl = _init_controller(
+        _grpo_master_config(tmp_path),
+        _actor_args_for_init(value_handle=value, value_loss_fn=value_loss_fn),
+    )
+
+    assert ctrl._value is value
+    assert ctrl._value_loss_fn is value_loss_fn
+
+
+def test_init_leaves_the_critic_handles_unset_on_a_grpo_run(
+    monkeypatch, tmp_path
+) -> None:
+    """actor_args defaults them to None, and older args may omit them entirely."""
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+
+    ctrl = _init_controller(_grpo_master_config(tmp_path), _actor_args_for_init())
+
+    assert ctrl._value is None
+    assert ctrl._value_loss_fn is None
 
 
 def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
