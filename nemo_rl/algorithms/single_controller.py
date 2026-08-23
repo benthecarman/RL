@@ -288,6 +288,7 @@ class SingleControllerActor:
         """Main entry point. Runs until max_train_steps is reached."""
         # Synchronize weights before starting the pumps
         await self._sync_weights()
+        self._rollout_manager.set_weight_version(self._trainer_version)
 
         await self._maybe_restore_replay_buffer()
         await self._maybe_restore_replacement_reserve()
@@ -1172,9 +1173,13 @@ class SingleControllerActor:
                         if calibration_batches
                         else None
                     )
-                    aborted_stale_inflight_groups = await self._sync_weights(
-                        calibration_data=calibration_data
-                    )
+                    # Critic warmup doesn't need refit, and the version still advances.
+                    aborted_stale_inflight_groups = 0
+                    if is_policy_training_step:
+                        aborted_stale_inflight_groups = await self._sync_weights(
+                            calibration_data=calibration_data
+                        )
+                    self._rollout_manager.set_weight_version(self._trainer_version)
                     step_metrics.update(
                         {
                             "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
@@ -1752,7 +1757,6 @@ class SingleControllerActor:
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
-        self._rollout_manager.set_weight_version(self._trainer_version)
         self._rollout_permitted.set()
         return aborted_stale_inflight_groups
 
