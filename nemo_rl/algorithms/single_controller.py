@@ -56,6 +56,7 @@ from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
+    algo_config,
     validate_sampler_buffer_capacity,
     validate_single_controller_config,
 )
@@ -126,13 +127,14 @@ class SingleControllerActor:
         self._partition_id: str = actor_args.partition_id
 
         self._master_config = master_config
+        self._algo_cfg = algo_config(master_config)
         self._async_cfg = master_config.async_rl
         self._policy_logprobs_required = not (
             master_config.loss_fn.force_on_policy_ratio
-            and master_config.grpo.seq_logprob_error_threshold is None
+            and self._algo_cfg.seq_logprob_error_threshold is None
         )
         self._reference_logprobs_required = not bool(
-            master_config.grpo.skip_reference_policy_logprobs_calculation
+            self._algo_cfg.skip_reference_policy_logprobs_calculation
         )
         self._dp_client = actor_args.dp_client
         self._gen: Generation = actor_args.gen_handle
@@ -190,7 +192,7 @@ class SingleControllerActor:
         self._train_cluster = actor_args.train_cluster
         self._inference_cluster = actor_args.inference_cluster
 
-        num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
+        num_prompts_per_step = self._algo_cfg.num_prompts_per_step
         self._sampler = create_sampler(self._buffer, self._async_cfg.sampler)
         self._sampler.set_dispatch_index(actor_args.save_state.current_step)
         required_capacity = self._sampler.required_buffer_capacity(num_prompts_per_step)
@@ -381,7 +383,7 @@ class SingleControllerActor:
             buffer_state,
             max_groups=self._async_cfg.max_buffered_rollouts,
             expected_partition_id=self._partition_id,
-            expected_group_size=self._master_config.grpo.num_generations_per_prompt,
+            expected_group_size=self._algo_cfg.num_generations_per_prompt,
         )
         # Each buffered group holds one _buffer_capacity permit; the load
         # truncation guarantees restored <= capacity, so this never blocks.
@@ -581,7 +583,7 @@ class SingleControllerActor:
                 )
             )
 
-        max_epochs = self._master_config.grpo.max_num_epochs
+        max_epochs = self._algo_cfg.max_num_epochs
         async with asyncio.TaskGroup() as rollout_tasks:
             while max_epochs is None or self._current_epoch < max_epochs:
                 for prompt_batch in self._dataloader:
@@ -695,7 +697,7 @@ class SingleControllerActor:
         only "replace" ever fills one, so the gate would buy nothing while stranding a
         pool restored from a checkpoint into a run that has since switched to "shrink".
         """
-        num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
+        num_prompts_per_step = self._algo_cfg.num_prompts_per_step
         while len(self._replacement_reserve) >= num_prompts_per_step:
             # Take the step's prompts out before the first await. A drop resolving
             # concurrently draws from this same pool, and could otherwise claim one of
@@ -821,7 +823,7 @@ class SingleControllerActor:
                 ``num_prompts_per_step``. Training a fraction of a batch is a silent
                 change to the gradient estimate, so it is refused rather than absorbed.
         """
-        num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
+        num_prompts_per_step = self._algo_cfg.num_prompts_per_step
         dropped = self._batch_shortfall.get(step, 0)
         target = num_prompts_per_step - dropped
         fraction = self._async_cfg.rollout_failure.min_step_batch_fraction
@@ -853,9 +855,7 @@ class SingleControllerActor:
           5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
              per dropped group, then sync.
         """
-        grpo_cfg = self._master_config.grpo
-
-        while self._train_steps < grpo_cfg.max_num_steps:
+        while self._train_steps < self._algo_cfg.max_num_steps:
             version_during_step = self._trainer_version
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
@@ -1050,7 +1050,7 @@ class SingleControllerActor:
                         chunks_dispatched,
                         num_groups,
                         groups_dispatched,
-                        grpo_cfg.num_prompts_per_step,
+                        self._algo_cfg.num_prompts_per_step,
                     )
 
                 log.info(
@@ -1145,7 +1145,7 @@ class SingleControllerActor:
                 self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
                 self._timeout.mark_iteration()
 
-                is_last_step = self._train_steps >= grpo_cfg.max_num_steps or (
+                is_last_step = self._train_steps >= self._algo_cfg.max_num_steps or (
                     self._rollout_exhausted.is_set() and len(self._buffer) == 0
                 )
                 ft_save_period = self._master_config.checkpointing.get("ft_save_period")
@@ -1210,7 +1210,7 @@ class SingleControllerActor:
             # generated with; lag = training version - oldest sample version.
             lag = version_during_step - min_sample_version  # type: ignore
             print(
-                f"train step {self._train_steps}/{grpo_cfg.max_num_steps}  "
+                f"train step {self._train_steps}/{self._algo_cfg.max_num_steps}  "
                 f"trainer_v={self._trainer_version}  "
                 f"lag={lag}  ",
                 flush=True,
@@ -1239,7 +1239,7 @@ class SingleControllerActor:
         is what is checked instead.
         """
         watchdog_cfg = self._async_cfg.stall_watchdog
-        max_num_steps = self._master_config.grpo.max_num_steps
+        max_num_steps = self._algo_cfg.max_num_steps
         last_progress = (-1, -1)
         last_progress_at = time.monotonic()
 
@@ -1705,9 +1705,7 @@ class SingleControllerActor:
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
 
-        seq_logprob_error_threshold = (
-            self._master_config.grpo.seq_logprob_error_threshold
-        )
+        seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,
         # report sequence-level generation/training mismatch. A threshold adds
         # masking; leaving it unset keeps this metrics-only.
